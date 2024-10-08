@@ -3,187 +3,221 @@ import mongoose from 'mongoose';
 import cron from 'node-cron';
 import dotenv from 'dotenv';
 import cors from 'cors';
-import puppeteer from 'puppeteer'; // Import Puppeteer
-import { MongoClient, ServerApiVersion } from 'mongodb'; // Corrected import
+import puppeteerExtra from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import puppeteer from 'puppeteer';
+import fs from 'fs';
+import fsPromises from 'fs/promises';
+import axios from 'axios';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import sharp from 'sharp'; // Added sharp for image conversion
 
+// Load environment variables
 dotenv.config();
 
+// Puppeteer stealth plugin setup to avoid detection by anti-bot systems
+puppeteerExtra.use(StealthPlugin());
+
+// Express app setup
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Mongoose MongoDB connection (for handling reviews)
-mongoose.set('strictQuery', false);
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-});
+// Directory setup for saving review profile images
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const IMAGE_DIR = path.join(__dirname, 'review_profile_images');
 
-// Define Review Schema
-const reviewSchema = new mongoose.Schema({
-  name: String,
-  text: String,
-  rating: Number,
-  date: String,
-  photo: String,
-});
-
-const Review = mongoose.model('Review', reviewSchema);
-const FallbackReview = mongoose.model('FallbackReview', reviewSchema); // Backup reviews
-
-// MongoDB Client Integration (corrected to import)
-const uri = "mongodb+srv://Artisan_Summykai:(vXWu%3F4njWBexWk1m7%5Dd@testimonialsdb.lfz9p.mongodb.net/?retryWrites=true&w=majority&appName=TestimonialsDB";
-
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
-
-async function run() {
-  try {
-    await client.connect();
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
-  } catch (err) {
-    console.error("MongoClient connection error:", err);
-  } finally {
-    await client.close();
-  }
+// Utility function to save a screenshot of the page
+async function saveScreenshot(page, name) {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const filePath = `debug-screenshots/${name}-${timestamp}.png`;
+  await fsPromises.mkdir('debug-screenshots', { recursive: true });
+  await page.screenshot({ path: filePath, fullPage: true });
+  console.log(`Screenshot saved: ${filePath}`);
 }
 
-run().catch(console.dir);
+// Utility function to save the page's HTML for debugging
+async function saveHTML(page, name) {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const filePath = `debug-html/${name}-${timestamp}.html`;
+  await fsPromises.mkdir('debug-html', { recursive: true });
+  const content = await page.content();
+  await fsPromises.writeFile(filePath, content);
+  console.log(`HTML saved: ${filePath}`);
+}
 
-// --- Existing Puppeteer and Scraping Logic --- //
-
-// Function to initialize Puppeteer and launch the browser
+// Initialize and configure Puppeteer browser with custom settings
 async function initializeBrowser() {
-  const browser = await puppeteer.launch({ headless: true }); // Set to false for debugging
+  return await puppeteerExtra.launch({
+    headless: process.env.HEADLESS_MODE === 'true', // Use headless mode based on environment variable
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-infobars',
+      '--window-position=0,0',
+      '--ignore-certificate-errors',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--window-size=1920,1080',
+      '--lang=en-US,en',
+      '--enable-automation', // To mimic human browser
+      '--disable-blink-features=AutomationControlled', // Remove automation features that indicate bot behavior
+    ],
+  });
+}
+
+// Setup the Puppeteer page with a custom viewport and headers
+async function setupPage(browser) {
   const page = await browser.newPage();
-  return { browser, page };
-}
+  
+  // Set browser window size
+  await page.setViewport({ width: 1920, height: 1080 });
 
-// Function to extract review data using XPath
-async function extractReviewData(page, reviewXPath) {
-  try {
-    const name = await page.$eval(
-      `${reviewXPath}/div/div[2]/div/div[1]/span/a`,
-      (el) => el.innerText
-    ).catch(() => 'Anonymous');
-
-    const reviewText = await page.$eval(
-      `${reviewXPath}/div/div[3]/p/span`,
-      (el) => el.innerText
-    ).catch(() => 'No review text available.');
-
-    const ratingHandle = await page.$x(
-      `${reviewXPath}/div/div[2]/div/div[1]/span/div`
-    );
-    const rating = await ratingHandle[0]
-      .evaluate((el) => el.getAttribute('aria-label'))
-      .catch(() => 'No rating available.');
-
-    const photoHandle = await page.$x(
-      `${reviewXPath}/div/div[1]/div/div[1]/div/div/div[1]/div/a/img`
-    );
-    const photo = await photoHandle[0]
-      .evaluate((el) => el.src)
-      .catch(() => 'No photo available.');
-
-    const dateHandle = await page.$x(
-      `${reviewXPath}/div/div[2]/div/div[2]/span`
-    );
-    const date = await dateHandle[0]
-      .evaluate((el) => el.innerText)
-      .catch(() => 'No date available.');
-
-    return {
-      name,
-      text: reviewText,
-      rating: rating.match(/\d+/)[0], // Extract numeric rating from aria-label
-      date,
-      photo,
+  // Modify browser properties to avoid detection as a bot
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false }); // Prevent detection by setting 'navigator.webdriver' to false
+  });
+  await page.evaluateOnNewDocument(() => {
+    window.navigator.chrome = {
+      runtime: {},
+      // Mock other properties to mimic Chrome
     };
+  });
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] }); // Set navigator.languages to mimic a real browser
+  });
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] }); // Mimic Chrome's plugins to avoid detection
+  });
+
+  // Set user-agent and referrer to simulate real browsing behavior
+  await page.setExtraHTTPHeaders({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0',
+    'Referer': 'https://www.yelp.com/'
+  });
+  
+  // Disable caching to avoid stale content
+  await page.setCacheEnabled(false);
+
+  // Override user agent to mimic non-headless browser
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'userAgent', {
+      get: () => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0',
+    });
+  });
+
+  // Intercept network requests to monitor resource loading
+  await page.setRequestInterception(true);
+  page.on('request', (req) => {
+    if (req.resourceType() === 'image' || req.resourceType() === 'stylesheet' || req.resourceType() === 'font') {
+      req.abort(); // Block unnecessary resources to improve speed and reduce detection
+    } else {
+      req.continue();
+    }
+  });
+
+  return page;
+}
+
+// Function to scrape reviews
+async function scrapeReviews() {
+  let browser;
+  try {
+    // Initialize browser and setup page
+    browser = await initializeBrowser();
+    const page = await setupPage(browser);
+
+    // Navigate to Yelp page and perform scraping
+    await navigateToYelpPage(page);
+
+    // Extract review data (dummy implementation for now)
+    console.log('Scraping reviews...');
+    // Your review extraction logic goes here
+
+    console.log('Scraping completed successfully.');
   } catch (error) {
-    console.error(`Error extracting data from XPath ${reviewXPath}:`, error);
-    return null;
+    console.error('Error during scraping:', error);
+  } finally {
+    if (browser) {
+      await browser.close(); // Ensure the browser is closed even if an error occurs
+    }
   }
 }
 
-// Main function to scrape reviews from Yelp
-async function scrapeReviews() {
-  const { browser, page } = await initializeBrowser();
-
+// Navigate to the Yelp page and perform auto-scrolling to load lazy-loaded content
+async function navigateToYelpPage(page) {
   try {
-    // Navigate to the Yelp reviews page (sorted by newest first)
+    console.log('Navigating to Yelp page...');
     await page.goto(
-      'https://www.yelp.com/biz/artisan-electrical-and-hvac-tracy-14?sort_by=date_desc#reviews'
+      'https://www.yelp.com/biz/artisan-electrical-and-hvac-tracy-14?sort_by=date_desc#reviews',
+      { waitUntil: 'domcontentloaded', timeout: 30000 }
     );
 
-    // Wait for the first review to load
-    await page.waitForXPath('//ul/li[1]', { timeout: 5000 });
+    // Inject the Yelp review script to ensure all reviews are loaded
+    await page.evaluate(() => {
+      const script = document.createElement('script');
+      script.src = 'https://s3-media0.fl.yelpcdn.com/assets/public/Reviews.yji-8ced2c27440e96a0f807.chunk.mjs';
+      document.body.appendChild(script);
+    });
 
-    const reviews = [];
-    for (let i = 1; i <= 3; i++) {
-      const reviewXPath = `/html/body/yelp-react-root/div[1]/div[6]/div/div[1]/div[1]/main/div[4]/div/section/div[2]/ul/li[${i}]`;
+    // Auto-scroll the page to trigger lazy-loading of elements
+    await page.evaluate(async () => {
+      await new Promise((resolve) => {
+        let totalHeight = 0;
+        const distance = 100;
+        const timer = setInterval(() => {
+          window.scrollBy(0, distance);
+          totalHeight += distance;
 
-      const reviewData = await extractReviewData(page, reviewXPath);
-      if (reviewData) reviews.push(reviewData);
-    }
+          // Stop scrolling once all content is loaded or after a reasonable scroll length
+          if (totalHeight >= document.documentElement.scrollHeight || totalHeight > 1500) {
+            clearInterval(timer);
+            resolve();
+          }
+        }, 100);
+      });
+    });
 
-    // Save scraped reviews to MongoDB and fallback collection
-    await Review.deleteMany({}); // Clear existing reviews
-    await Review.insertMany(reviews);
-
-    // Also update the fallback reviews
-    await FallbackReview.deleteMany({});
-    await FallbackReview.insertMany(reviews);
-
-    console.log('Reviews updated successfully');
+    // Save page screenshot and HTML after scrolling
+    await saveScreenshot(page, 'post-auto-scroll');
+    await saveHTML(page, 'post-auto-scroll');
   } catch (error) {
-    console.error('Error during the scraping process:', error);
-  } finally {
-    await browser.close();
+    console.error('Error navigating to Yelp page:', error);
+    throw error;
   }
 }
 
-// Function to fetch reviews (and fallback to backup if needed)
-async function getReviews() {
-  let reviews = await Review.find().limit(3);
-
-  if (reviews.length < 3) {
-    console.warn('Insufficient reviews, falling back to backup.');
-    const fallbackReviews = await FallbackReview.find().limit(3);
-    
-    // Fill any gaps with fallback reviews
-    reviews = [...reviews, ...fallbackReviews].slice(0, 3);
-  }
-
-  return reviews;
-}
-
-// API endpoint to get reviews
-app.get('/api/reviews', async (req, res) => {
+// Main execution function to start the server and schedule scraping
+(async () => {
   try {
-    const reviews = await getReviews();
-    res.json(reviews);
+    // MongoDB connection setup
+    mongoose.set('strictQuery', false);
+    await mongoose.connect(process.env.MONGODB_URI);
+    console.log("Connected to MongoDB successfully.");
+
+    // Ensure the directory for saving images exists
+    await fsPromises.mkdir(IMAGE_DIR, { recursive: true });
+
+    // Start the server and initialize scraping
+    const PORT = process.env.PORT || 5000;
+    app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+    // Perform the initial scraping process
+    await scrapeReviews().catch((error) => console.error('Initial scrape error:', error));
+
+    // Schedule regular scraping to run daily at midnight
+    cron.schedule('0 0 * * *', async () => {
+      try {
+        await scrapeReviews();
+      } catch (error) {
+        console.error('Error during scheduled scraping:', error.message);
+      }
+    });
   } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch reviews.' });
+    console.error('Error during initialization:', error);
+    process.exit(1);
   }
-});
-
-// Schedule the scraping task to run every day at midnight
-cron.schedule('0 0 * * *', () => {
-  scrapeReviews().catch((error) =>
-    console.error('Error during the scheduled scraping:', error)
-  );
-});
-
-// Start the server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-// Run initial scrape on server startup
-scrapeReviews().catch((error) => console.error('Initial scrape error:', error));
+})();
